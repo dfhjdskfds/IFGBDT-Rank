@@ -16,8 +16,8 @@ Folders:
   * To run the GBDT-Rank, project baseline, and random baseline with the hyperparameters in our paper, run 'python german_baseline.py
   * To run the IFGBDT-Rank experiments with the hyperparameters in our paper, run 'python german.py
   
-  - "Microsoft’s Learning to Rank": This folder contains the code to reproduce the Microsoft LTR experiments.
-    * First, download the data https://www.microsoft.com/en-us/research/project/mslr/ (the MSLR-WEB10K data), and save it to a folder called "original_data".
-    * Second, run the 'preprocess_MSLR.ipynb' notebook to preprocess the data.
-    * To run the GBDT-Rank, project baseline, and random baseline with the hyperparameters in our paper, run 'python german_baseline.py
-    * To run the IFGBDT-Rank experiments with the hyperparameters in our paper, run 'python german.py
+- "Microsoft’s Learning to Rank": This folder contains the code to reproduce the Microsoft LTR experiments.
+ * First, download the data https://www.microsoft.com/en-us/research/project/mslr/ (the MSLR-WEB10K data), and save it to a folder called "original_data".
+ * Second, run the 'preprocess_MSLR.ipynb' notebook to preprocess the data.
+ * To run the GBDT-Rank, project baseline, and random baseline with the hyperparameters in our paper, run 'python german_baseline.py
+ * To run the IFGBDT-Rank experiments with the hyperparameters in our paper, run 'python german.py
