@@ -11,23 +11,35 @@ import tensorflow_probability as tfp
 import tensorflow.compat.v1 as tf
 tf.disable_v2_behavior()
 
+TB_BASE = './tensorboard_simulations/'
+RESULTS_BASE = './results_simulations/'
+METRICS_BASE = './metrics/'
+HEATMAPS_BASE = './heatmaps/'
+DISPLACEMENT_BASE = './displacement/'
+NAN_FAIL = './nan_fail/'
+
 def DCG(position_bias, relevances):
     # there is a +2 because the min value of i in DCG definition is 1
-    return tf.math.reduce_sum(tf.multiply(position_bias, 2.**relevances-1), axis=1) 
+    return tf.math.reduce_sum(tf.multiply(position_bias, 2.**relevances-1), axis=1)
 
 def best_DCG(position_bias, relevances):
     return tf.math.reduce_sum(tf.multiply(position_bias, 2.**tf.sort(relevances, axis=1, direction='DESCENDING') - 1), axis=1)
 
 def query_distance_or_plan(proj_compl, query_1, query_2, distance = True):
+    '''
+    proj_compl: projection matrix onto orthogonal complement of sensitive subspace
+    query_1, query_2: both are num_items x d matrices where each row corresponds to one item in the query
+    distance: True means compute the distance, False means return the optimal transport plan matrix
+    '''
     num_items, d = query_1.shape
 
     a = np.ones(num_items) / num_items
     b = np.copy(a)
-    query_1 = np.copy(query_1)@proj_compl.T  # 矩阵乘法
+    query_1 = np.copy(query_1)@proj_compl.T
     query_2 = np.copy(query_2)@proj_compl.T
 
-    r_1 = np.tile(np.linalg.norm(query_1, axis = 1)**2, (num_items, 1)).T  # np.tile: 把数组沿各个方向复制
-    r_2 = np.tile(np.linalg.norm(query_2, axis = 1)**2, (num_items, 1))    # np.linalg.norm(), 求范数，axis=1表示按行向量处理，求多个行向量的范数
+    r_1 = np.tile(np.linalg.norm(query_1, axis = 1)**2, (num_items, 1)).T
+    r_2 = np.tile(np.linalg.norm(query_2, axis = 1)**2, (num_items, 1))
     C = r_1 - 2*query_1@query_2.T + r_2
 
     if distance:
@@ -40,7 +52,9 @@ def get_binary_group_exposure(tf_position_bias, tf_group_membership, tf_relevanc
     minority_count = tf.reduce_sum(1-tf_group_membership, axis = 1)
     majority_relevance_count = tf.reduce_sum(tf_group_membership*tf_relevances, axis = 1)
     minority_relevance_count = tf.reduce_sum((1-tf_group_membership)*tf_relevances, axis = 1)
-    
+
+    # we will multiply and divide by beta so that anytime the minority or majority group has 0 items in the query, the group exposure will be equal to 0
+    #there was a calculation like a/b - c/d. and if b or d is 0 the whole thing should be set equal to 0. but i did that individually for a/b and c/d. so if d = 0, i computed a/b - c/d as a/b instead of 0.
     beta = minority_count*majority_count*majority_relevance_count*minority_relevance_count
 
     group_1_merit = tf.math.divide_no_nan(beta*tf.math.divide_no_nan(tf.reduce_sum(tf.multiply(tf_group_membership,tf_relevances), axis =1), majority_count), beta)
@@ -140,6 +154,9 @@ def weighted_kendall_tau(ranking_1, ranking_2, p, score_1, score_2):
     return (num_agree - num_disagree) / num_pairs, disagree, displacement_vec
 
 def displacement(ranking_1, ranking_2):
+    '''
+    returns an array of size len(score_1) where the i-th entry says its new rank, ie the first position says what the new rank under score_2 of the first ranked item is in score_1
+    '''
     displacement = np.zeros(len(ranking_1))
     for i in range(len(ranking_1)):
         displacement[i] = int(np.argwhere(ranking_2 == ranking_1[i])[0])
@@ -150,8 +167,8 @@ def get_weights(ranking_1, ranking_2, p):
     p_moved = np.zeros(len(ranking_1))
     denom = np.zeros(len(ranking_1))
     displacement_vec = displacement(ranking_1,ranking_2)
-    p_id[ranking_1] = p  
-    p_moved[ranking_1] = p[displacement_vec.astype(int)]  
+    p_id[ranking_1] = p
+    p_moved[ranking_1] = p[displacement_vec.astype(int)]
     denom[ranking_1] = np.arange(len(ranking_1)) - displacement_vec
     p_bar = [(p_id[i] - p_moved[i] )/ denom[i] if np.abs(denom[i]) > 0 else 1 for i in range(len(p_id))]
     return p_bar, displacement_vec
@@ -164,6 +181,121 @@ def get_ranking_prob(ranking, scores):
         prob *= scores[i] / np.sum(scores[i:])
     return prob
 
+def compute_top_one_KL(X, CF_X, sess, l_pred, num_items_per_query, distances):
+    scores = np.exp(l_pred.eval({'tf_X:0': X}).reshape(-1, num_items_per_query))
+    score_sum = np.sum(scores, axis = 1)
+    probs = scores / score_sum.reshape(-1,1)
+    cf_scores = np.exp(l_pred.eval({'tf_X:0': CF_X}).reshape(-1, num_items_per_query))
+    cf_score_sum = np.sum(cf_scores, axis = 1)
+    cf_probs = cf_scores / cf_score_sum.reshape(-1,1)
+
+    ratio = np.log(probs / cf_probs)
+    KL = np.sum(probs*ratio, axis = 1)
+
+    return np.mean(KL), np.mean(KL/distances.reshape(-1,1))
+
+def compute_KL(X, CF_X, tf_sample_ranking, num_monte_carlo_samples, tf_scores, num_items_per_query, l_pred, sess, distance):
+    # sample rankings
+
+    ranking_list = get_rankings_list(tf_sample_ranking, num_monte_carlo_samples, tf_scores, num_items_per_query, l_pred, {'tf_X:0': X}, sess)
+
+    scores = np.exp(l_pred.eval({'tf_X:0': X}).reshape(-1, num_items_per_query))
+    cf_scores = np.exp(l_pred.eval({'tf_X:0': CF_X}).reshape(-1, num_items_per_query))
+
+    KL = []
+    scaled_KL = []
+    for i in range(len(ranking_list)):
+        kl = 0
+        rankings = ranking_list[i]
+        for j in range(len(rankings)):
+            ranking = rankings[j,:]
+            p_ranking = get_ranking_prob(ranking, np.copy(scores[i,:]))
+            p_cf_ranking = get_ranking_prob(ranking, np.copy(cf_scores[i,:]))
+            #print(p_ranking, p_cf_ranking)
+            kl+=np.log(p_ranking/p_cf_ranking)
+            #kl+=p_ranking*np.log(p_ranking/p_cf_ranking)
+        KL.append(kl/num_monte_carlo_samples)
+        scaled_KL.append(kl/num_monte_carlo_samples/distance[i])
+    return np.mean(KL), np.mean(scaled_KL)
+
+def compute_individual_fairness_metrics(X, X_all, proj_compl, num_items_per_query, l_pred, sess, position_bias, p, num_monte_carlo_samples, tf_scores, tf_sample_ranking, deterministic, all_dict, get_closest = True):
+    _, d = X.shape
+    # first for each query, find the query closest to it in the fair distance and get the distance
+    # this cannot be done in tensorflow
+    if get_closest:
+        D, closest_query = get_closest_queries(X, X_all, proj_compl, num_items_per_query)
+    else:
+        closest_query = np.copy(X_all)
+
+    # get scores
+    X_scores = sess.run(l_pred, feed_dict = {'tf_X:0': X})
+    X_closest_scores = sess.run(l_pred, feed_dict = {'tf_X:0': closest_query})
+
+    # get rankings
+    all_dict['tf_X:0'] = X
+    rankings_list = get_rankings_list(tf_sample_ranking, num_monte_carlo_samples, tf_scores, num_items_per_query, l_pred, all_dict, sess, deterministic = deterministic)
+    all_dict['tf_X:0'] = closest_query
+    CF_rankings_list = get_rankings_list(tf_sample_ranking, num_monte_carlo_samples, tf_scores, num_items_per_query, l_pred, all_dict, sess, deterministic = deterministic)
+
+    # compute l2 distance of scores
+    X_scores = X_scores.reshape(-1, num_items_per_query)
+    X_closest_scores = X_closest_scores.reshape(-1, num_items_per_query)
+    l2_score_distance = np.mean(np.linalg.norm(X_scores - X_closest_scores, axis = 1))
+
+    distance = np.linalg.norm(X-closest_query, axis = 1)
+
+    equalities = [1 for i in range(distance.shape[0]) if distance[i] == 0]
+    # print('number of points that are the same', len(equalities))
+    # print('ratio of points that are the same', np.mean([ np.sum(equalities[i*num_items_per_query:(i+1)*num_items_per_query])/ num_items_per_query for i in range(int(X.shape[0] / num_items_per_query))]))
+    # print('num-ites per query', num_items_per_query)
+    distance = np.linalg.norm(X.reshape(-1, d*num_items_per_query) - closest_query.reshape(-1, d*num_items_per_query), axis = 1)
+    KL, scaled_KL = compute_KL(X, closest_query, tf_sample_ranking, num_monte_carlo_samples, tf_scores, num_items_per_query, l_pred, sess, distance)
+    top_one_KL, scaled_top_one_KL = compute_top_one_KL(X, closest_query, sess, l_pred, num_items_per_query, distance)
+
+    #print(X.reshape(-1, d*num_items_per_query)[0,:])
+    #print(closest_query.reshape(-1, d*num_items_per_query)[0,:])
+    distance_euclidean = np.copy(distance)
+    print('CF EUCLIDEAN distance: min {} max {} mean {} median {} '.format(np.min(distance), np.max(distance), np.mean(distance), np.median(distance)))
+
+    distance = np.linalg.norm((X@(proj_compl.T)).reshape(-1, d*num_items_per_query) - (closest_query@(proj_compl.T)).reshape(-1, d*num_items_per_query), axis = 1)
+
+    print('CF FAIR distance: min {} max {} mean {} median {}'.format(np.min(distance), np.max(distance), np.mean(distance), np.median(distance)))
+
+    min_idx = np.argmin(distance)
+    max_idx = np.argmax(distance)
+
+    score_1 = np.zeros(num_items_per_query)
+    score_2 = np.zeros(num_items_per_query)
+
+    weighted_kts = []
+    scaled_weighted_kts = []
+    kts = []
+    scaled_kts = []
+    displacement_vecs = np.zeros(num_items_per_query)
+    displacement_heatmap = np.zeros((num_items_per_query, num_items_per_query))
+    for i in range(len(rankings_list)):
+        rankings = rankings_list[i]
+        cf_rankings = CF_rankings_list[i]
+        score_1[rankings] = np.arange(num_items_per_query)[::-1]
+        score_2[cf_rankings] = np.arange(num_items_per_query)[::-1]
+        for j in range(rankings.shape[0]):
+            real_ranking = rankings[j, :]
+            cf_ranking = cf_rankings[j,:]
+            displacement_vec = displacement(real_ranking,cf_ranking)
+            displacement_vecs += np.copy(displacement_vec)
+            #reg_kt, kt, displacement_vec = weighted_kendall_tau(real_ranking, cf_ranking, p, score_1, score_2)
+            displacement_heatmap[np.arange(num_items_per_query), displacement_vec.astype(int)] += 1
+            weighted_kt, _ = stats.weightedtau(score_1, score_2)
+            kt, _ = stats.kendalltau(score_1, score_2)
+            # print('kt', kt)
+            # print(real_ranking)
+            # print(cf_ranking)
+            kts.append(kt)
+            weighted_kts.append(weighted_kt)
+            scaled_weighted_kts.append(weighted_kt/(distance[i]))
+            scaled_kts.append(kt/distance[i])
+    return l2_score_distance, np.mean(weighted_kts), np.mean(scaled_weighted_kts), np.mean(kts), np.mean(scaled_kts), displacement_vecs / (num_monte_carlo_samples*len(rankings_list)), displacement_heatmap / (num_monte_carlo_samples*len(rankings_list)), KL, scaled_KL, top_one_KL, scaled_top_one_KL
+
 def compl_svd_projector(names, svd=-1):
     if svd > 0:
         tSVD = TruncatedSVD(n_components=svd)
@@ -174,10 +306,10 @@ def compl_svd_projector(names, svd=-1):
     else:
         basis = names.T
 
-    proj = np.linalg.inv(np.matmul(basis.T, basis))  
+    proj = np.linalg.inv(np.matmul(basis.T, basis))
     proj = np.matmul(basis, proj)
     proj = np.matmul(proj, basis.T)
-    proj_compl = np.eye(proj.shape[0]) - proj  
+    proj_compl = np.eye(proj.shape[0]) - proj
     # print('proj_compl', proj_compl)
     return proj_compl
 
@@ -192,11 +324,6 @@ def bias_variable(shape, name):
     initial = tf.constant(0.1, shape=shape)
     return tf.Variable(initial, name=name)
 
-def phi_variable(shape, name):
-    init_range = np.sqrt(.5 / (shape[-1] + shape[-2]))
-    initial = tf.random_uniform(shape, minval=-init_range, maxval=init_range, dtype=tf.float32)
-    return tf.Variable(initial, name=name)
-
 def weight_variable(shape, name, init_range=-1):
     if init_range == -1:
         if len(shape) > 1:
@@ -207,27 +334,25 @@ def weight_variable(shape, name, init_range=-1):
     initial = tf.random_uniform(shape, minval=-init_range, maxval=init_range, dtype=tf.float32)
     return tf.Variable(initial, name=name)
 
-def fc_network(variables, t, layer_in, n_layers, l=0, activ_f = tf.nn.relu, units = [], bias = True):
+def fc_network(variables, layer_in, n_layers, l=0, activ_f = tf.nn.relu, units = [], bias = True):
     #this is setting up all the matrix multiplication to do a forward pass
     if l==n_layers-1:
         if bias == True:
-            layer_out = tf.matmul(layer_in, variables['weight_' + str(t) + str(l)]) + variables['bias_' + str(t) + str(l)]
-            A = tf.math.sigmoid(layer_out)
+            layer_out = tf.matmul(layer_in, variables['weight_'+str(l)]) + variables['bias_' + str(l)]
         else:
-            layer_out = tf.matmul(layer_in, variables['weight_' + str(t) + str(l)])
-            A = tf.math.sigmoid(layer_out)
+            layer_out = tf.matmul(layer_in, variables['weight_'+str(l)])
         units.append(layer_out)
-        return A
+        return layer_out, units
     else:
         if bias == True:
-            layer_out = activ_f(tf.matmul(layer_in, variables['weight_' + str(t) + str(l)]) + variables['bias_' + str(t) + str(l)])
+            layer_out = activ_f(tf.matmul(layer_in, variables['weight_'+str(l)]) + variables['bias_' + str(l)])
         else:
-            layer_out = activ_f(tf.matmul(layer_in, variables['weight_' + str(t) + str(l)])) #+ variables['bias_' + str(l)])
+            layer_out = activ_f(tf.matmul(layer_in, variables['weight_'+str(l)])) #+ variables['bias_' + str(l)])
         l += 1
         units.append(layer_out)
-        return fc_network(variables, t, layer_out, n_layers, l=l, activ_f=activ_f, units=units, bias = bias)
+        return fc_network(variables, layer_out, n_layers, l=l, activ_f=activ_f, units=units, bias = bias)
 
-def forward_fair_reg(tf_X, tf_X_utility, tf_fair_X, tf_counter_X, weights=None, n_units = None, activ_f = tf.nn.relu, bias = True, init_range = -1):
+def forward_fair_reg(tf_X, tf_X_utility, tf_fair_X, tf_counter_X, batch_relevance, batch_relevance_utility, weights=None, n_units = None, activ_f = tf.nn.relu, bias = True, init_range = -1):
     T = 40
     tree_levels = 4
     leafs_numb = 2 ** (tree_levels - 1)
@@ -264,7 +389,9 @@ def forward_fair_reg(tf_X, tf_X_utility, tf_fair_X, tf_counter_X, weights=None, 
                     variables['bias_' + str(t) + str(l)] = tf.constant(weights[weight_ind], dtype=tf.float32)
                     weight_ind += 1
 
+    ## Defining NN architecture
     def node_probability(index_node, A):
+        # import pdb; pdb.set_trace()
         a = tf.ones_like(A)
         p = a[:,0]
 #         p = tf.ones(A.shape[0], dtype=tf.float64)
@@ -295,9 +422,11 @@ def forward_fair_reg(tf_X, tf_X_utility, tf_fair_X, tf_counter_X, weights=None, 
         inner_prob_matrix = tf.stack(ta, axis=0)
         return inner_prob_matrix
 
-    def compute_boosting_output(X, variables):
+    def compute_boosting_output(X, variables, Y):
         a = tf.zeros_like(X)
         output_sum = a[:,0]
+#         import pdb; pdb.set_trace()
+#         output_sum = tf.zeros(X.shape[0])
         output = []
         for t in range(T):
             A = fc_network(variables, t, X, n_layers, activ_f = activ_f, bias = bias)
@@ -305,15 +434,18 @@ def forward_fair_reg(tf_X, tf_X_utility, tf_fair_X, tf_counter_X, weights=None, 
             inner_prob_matrix = compute_inner_prob_matrix(A)
             output.append(tf.matmul(tf.transpose(leafs_prob_matrix, perm=[1, 0]), variables['phi_' + str(t)]))
             output_sum = output_sum + 0.1 * tf.squeeze(output[t])
-        return output_sum
+            loss_Boosting = tf.exp(-tf.multiply(output_sum, Y))
+            residual = tf.multiply(loss_Boosting, Y)
+            cost_wr = tf.reduce_sum(tf.pow((residual - tf.squeeze(output[t])), 2))
+        return output_sum, cost_wr
 
-    l_pred = compute_boosting_output(tf_X, variables)
-    l_preds_fair = compute_boosting_output(tf_fair_X, variables)
-    l_pred_utility = compute_boosting_output(tf_X_utility, variables)
-    l_preds_counter = compute_boosting_output(tf_counter_X, variables)
+#     import pdb; pdb.set_trace()
+    l_pred, _ = compute_boosting_output(tf_X, variables, batch_relevance)
+    l_preds_fair, _ = compute_boosting_output(tf_fair_X, variables, batch_relevance)
+    l_pred_utility, cost_pred = compute_boosting_output(tf_X_utility, variables, batch_relevance_utility)
+    l_preds_counter, _ = compute_boosting_output(tf_counter_X, variables,batch_relevance)
 
-    return variables, l_pred, l_pred_utility, l_preds_fair, l_preds_counter
-
+    return variables, l_pred, l_pred_utility, l_preds_fair, l_preds_counter, cost_pred
     
 def get_rankings_list(tf_sample_ranking, num_monte_carlo_samples, tf_scores, num_items_per_query, l_pred, feed_dict, sess, deterministic = False):
     if deterministic:
@@ -359,7 +491,7 @@ def get_utility_objective(tf_group_membership, num_items_per_query, batch_size, 
     # we are negating it because we want to maximize the utililty, but use a minimizer
     # relevances needs to be num_monte_carlo_samples*num_queries by num_items_per_query
 
-    tf_reversed_scores = tf.reverse(tf.reshape(tf_scores, shape=(num_monte_carlo_samples*batch_size, num_items_per_query)), axis =[1])  # tf.reverse反转张量，axis为轴，axis = [1] 为在最外层反转
+    tf_reversed_scores = tf.reverse(tf.reshape(tf_scores, shape=(num_monte_carlo_samples*batch_size, num_items_per_query)), axis =[1])
 
     tf_reshaped_group_membership = tf.reshape(tf_group_membership, shape=(num_monte_carlo_samples*batch_size, num_items_per_query))
 
@@ -374,7 +506,7 @@ def get_utility_objective(tf_group_membership, num_items_per_query, batch_size, 
     group_0_exposure = tf.reduce_mean(tf.reshape(group_0_exposure, shape = (-1, num_monte_carlo_samples)), axis = 1)
 
 
-    alpha = tf.math.sign(group_1_merit-group_0_merit) # y = sign(x) = -1 if x < 0; 0 if x == 0; 1 if x > 0.
+    alpha = tf.math.sign(group_1_merit-group_0_merit)
     alpha = tf.where(group_1_merit-group_0_merit>=0, tf.ones(batch_size), alpha )
 
     temp = tf.math.maximum(0., alpha*(tf.math.divide_no_nan(group_1_exposure,group_1_merit)  - tf.math.divide_no_nan(group_0_exposure, group_0_merit)))
@@ -386,6 +518,12 @@ def get_utility_objective(tf_group_membership, num_items_per_query, batch_size, 
 
 
     alpha = tf.math.sign(group_1_merit-group_0_merit)
+
+    # only take an average over queries that contain at least one minority/majority
+    # need to divie by num_monte_carlo_samples too because you need to divide by number of queries, not queries*num_monte_carlo_samples
+    # diversity_count = (batch_size*num_monte_carlo_samples -tf.reduce_sum(tf.math.floor(tf.reduce_sum(tf_reshaped_group_membership, axis = 1) / num_items_per_query))) / float(num_monte_carlo_samples)
+    # binary_group_exposure = tf.reduce_sum(binary_group_exposure) / diversity_count
+
 
     if baseline_ndcg:
         ndcg_mean = tf.reshape(tf.reduce_mean(tf.reshape(ndcg, shape = (batch_size,num_monte_carlo_samples)), axis =1), shape = (-1, 1))
@@ -402,13 +540,23 @@ def get_utility_objective(tf_group_membership, num_items_per_query, batch_size, 
         return ndcg, dcg, obj, binary_group_exposure, []
 
 def get_adv_objective(tf_pi_list, tf_X, tf_fair_X, num_items_per_query, tf_proj_compl):
+    '''
+    returns the objective to get the adversarial examples
+    can you make this any faster?
+    '''
     objective = 0
     for i in range(len(tf_pi_list)):
+        # get transport plan
+        # are there any issues here like np.copy()?
         start_idx = i*num_items_per_query
         end_idx = (i+1)*num_items_per_query
 
+        # maybe there is a way to vectorize this with a 3d tensor? but that is 0 filled because the queries have different lengths <- oh maybe this is not a problem since it only happens once
+        #i'm scared of issues with copying variables and pointing to the address not the value so that's why this is so long
+        # this vectorizes computing the pairwise distance matrix since d(x,y) =  ||x|| - 2xy' + ||y||
+        #print('i did check this once, but maybe it is good to check it again')
         rA = tf.reshape(tf.math.reduce_sum(tf.matmul(tf_X[start_idx:end_idx, :], tf_proj_compl)**2, 1), [-1,1])
-        rB = tf.transpose(tf.reshape(tf.math.reduce_sum(tf.matmul(tf_fair_X[start_idx:end_idx, :], tf_proj_compl)**2, 1), [-1,1]))  # tf.transpose为转置
+        rB = tf.transpose(tf.reshape(tf.math.reduce_sum(tf.matmul(tf_fair_X[start_idx:end_idx, :], tf_proj_compl)**2, 1), [-1,1]))
         D = -2*tf.linalg.matmul(tf.matmul(tf_X[start_idx:end_idx, :], tf_proj_compl),tf.transpose(tf.matmul(tf_fair_X[start_idx:end_idx, :], tf_proj_compl)))
         objective += tf.multiply(tf_pi_list[i], tf.identity(rA) + tf.identity(D) + tf.identity(rB))
 
@@ -425,6 +573,11 @@ def evaluate_query_distance(X, fair_X, proj_compl, batch_size, num_items_per_que
     return distance
 
 def get_minibatch(X, relevances, batches_of_queries, num_items_per_query, document_batch_size, k, group_membership):
+    # CHECKED
+    '''
+    document_batch_size: the largest number of documents summed over all queries in one minibatch
+    k: minibatch number
+    '''
     _, d = X.shape
     batch_size = batches_of_queries.shape[1]
     batch_doc_idx = [i*num_items_per_query + j for i in batches_of_queries[k] for j in range(num_items_per_query)]
@@ -442,7 +595,7 @@ def train_fair_nn(X_train, relevance_train, group_membership_train, num_items_pe
                   batch_size=100, epoch=100, verbose=True, activ_f=tf.nn.relu, l2_reg=0., plot=False,
                   lamb_init=2., adv_epoch=100, adv_step=1., epsilon=None, sens_directions=[], l2_attack=0.01, adv_epoch_full=10,
                   fair_reg=0., fair_start=0.5, seed=None, simul=False, load=False, num_monte_carlo_samples = 100, bias = True, init_range = -1,
-                  entropy_regularizer=.01, baseline_ndcg=False, COUNTER_INIT = .05, PG = False, PG_reg = 0, T = 40):
+                  entropy_regularizer=.01, baseline_ndcg=False, COUNTER_INIT = .05, PG = False, PG_reg = 0):
     '''
     This code assumes that each query has the same number of items.
 
@@ -530,6 +683,7 @@ def train_fair_nn(X_train, relevance_train, group_membership_train, num_items_pe
     tf_proj_compl = tf.constant(proj_compl, dtype = tf.float32, name = 'proj_compl')
     tf_lower_ones_matrix = tf.constant(lower_ones_matrix, dtype = tf.float32, name = 'lower_ones_matrix')
     tf_relevances = tf.placeholder(tf.float32, shape=[None], name='tf_relevances')
+    tf_relevances_utility = tf.placeholder(tf.float32, shape=[None], name='tf_relevances_utility')
     tf_scores = tf.placeholder(tf.float32, shape=[None,num_items_per_query], name='tf_scores')
     #PG code uses log base 2
     position_bias = np.array([1 / np.log2(i + 2) for i in range(num_items_per_query)])
@@ -558,7 +712,7 @@ def train_fair_nn(X_train, relevance_train, group_membership_train, num_items_pe
     else:
         tf_fair_X = tf_X + tf.matmul(adv_weights, tf_directions) + full_adv_weights
 
-    variables, l_pred, l_pred_utility, l_pred_fair, l_pred_counter = forward_fair_reg(tf_X, tf_X_utility, tf_fair_X, tf_counter_X, weights=weights, n_units = n_units, activ_f = activ_f, bias = bias, init_range = init_range)
+    variables, l_pred, l_pred_utility, l_pred_fair, l_pred_counter, boosting_cost = forward_fair_reg(tf_X, tf_X_utility, tf_fair_X, tf_counter_X, weights=weights, n_units = n_units, activ_f = activ_f, bias = bias, init_range = init_range)
 
     # we multiply by fair_reg because (1) it won't effect maximizing the adversarial examples since it's like changing lambda and (2) when we update the parameters of the NN we need this term
     fair_subspace_loss = fair_reg*tf.math.reduce_sum(tf.squared_difference(l_pred, l_pred_fair))/2
@@ -602,10 +756,9 @@ def train_fair_nn(X_train, relevance_train, group_membership_train, num_items_pe
         ndcg_test_deterministic, _, _, group_exposure_test_deterministic, _ = get_utility_objective(tf_group_membership, num_items_per_query, int(X_test.shape[0]/num_items_per_query), baseline_ndcg, 1, get_tf_ones_mean_matrix(1, int(X_test.shape[0]/num_items_per_query)), l_pred_utility, tf_lower_ones_matrix, tf_position_bias, tf.reshape(tf_relevances, shape=(int(X_test.shape[0]/num_items_per_query), num_items_per_query)))
 
     # we want to maximize but using a minimizer so multiply by -1
-    train_loss = -tf.reduce_sum(_train_loss) / float(batch_size*num_monte_carlo_samples)
+    train_loss = -tf.reduce_sum(_train_loss) / float(batch_size*num_monte_carlo_samples) + boosting_cost / float(batch_size*num_monte_carlo_samples)
     # add l_2 regularization of weights
-    for t in range(T):
-        train_loss += l2_reg*sum([tf.nn.l2_loss(variables['weight_' + str(t) + str(l)])  for l in range(len(n_units) + 1)])
+    train_loss += l2_reg*sum([tf.nn.l2_loss(variables['weight_' + str(l)]) for l in range(len(n_units) + 1)])
     # entropy regularizer
     probs = tf.math.softmax(tf.reshape(l_pred_utility, shape=(num_monte_carlo_samples*batch_size, num_items_per_query)))
     # we do not negate entropy since we want to maximize entropy but feed it into a minimzer
@@ -627,6 +780,31 @@ def train_fair_nn(X_train, relevance_train, group_membership_train, num_items_pe
     failed_full_attack = 0
     failed_subspace_attack = 0
 
+    tb_long = '_'.join(['adv-epoch:' + str(adv_epoch),
+                        'batch_size:' + str(batch_size), 'adv-step:' + str(adv_step),
+                        'l2_attack:' + str(l2_attack), 'adv_epoch_full:' + str(adv_epoch_full),
+                        'epsilon:' + str(epsilon), 'lr:' + str(lr), 'MC:' + str(num_monte_carlo_samples),
+                        'reg:' + str(fair_reg), 'epoch:' + str(epoch), 'l2reg:' + str(l2_reg), 'init_range:' + str(init_range)]) + '_' + 'arch:' + ','.join(list(map(str,n_units)))
+
+    tb_base_dir = TB_BASE + tf_prefix + '_' + tb_long
+    if seed is None:
+        folder_exists = True
+        post_idx = 0
+        tb_dir = tb_base_dir + '_' + str(post_idx)
+        while folder_exists:
+            if os.path.exists(tb_dir):
+                post_idx += 1
+                tb_dir = tb_base_dir + '_' + str(post_idx)
+            else:
+                os.makedirs(tb_dir)
+                folder_exists = False
+    else:
+        post_idx = seed
+        tb_dir = tb_base_dir + '_' + str(post_idx)
+        os.makedirs(tb_dir)
+
+    summary_writer = tf.summary.FileWriter(tb_dir)
+    # saver = tf.train.Saver(max_to_keep=0)
     out_freq = 1000
     save_freq = 100000
     fair_start = int(epoch*fair_start)
@@ -736,14 +914,12 @@ def train_fair_nn(X_train, relevance_train, group_membership_train, num_items_pe
                 adv_batch = batch_x
                 if fair_reg > 0:
                     all_dict = {tf_X: batch_x, tf_lamb: lamb, tf_counter_X: batch_x, tf_relevances: batch_relevance, tf_group_membership: batch_group_membership}
-                    # import pdb; pdb.set_trace() 
                     ranking_list = get_rankings_list(tf_sample_ranking, num_monte_carlo_samples, tf_scores, num_items_per_query, l_pred, all_dict, sess)
                     batch_x_utility, batch_relevance_utility, batch_group_membership_utility = prepare_data_for_utility_objective(batch_x, batch_relevance, ranking_list, batch_group_membership)
                     all_dict[tf_X_utility] = batch_x_utility
                     all_dict[tf_relevances] = batch_relevance_utility
                     all_dict[tf_group_membership] = batch_group_membership_utility
                     fair_X = tf_fair_X.eval(feed_dict = all_dict)
-#                     print('fair_X:',fair_X)
                     for i in range(batch_size):
                         all_dict['pi_{}:0'.format(str(i))] = query_distance_or_plan(proj_compl, batch_x[i*num_items_per_query:(i+1)*num_items_per_query, :], fair_X[i*num_items_per_query:(i+1)*num_items_per_query, :], distance = False)
 
@@ -878,7 +1054,10 @@ def train_fair_nn(X_train, relevance_train, group_membership_train, num_items_pe
             weights = [x.eval() for x in variables.values()]
 
             if CF_X_train is None:
-               
+                l2_score_distance, kts, scaled_kts, reg_kts, scaled_reg_kts, displacement_train_stochastic, heatmap_train_stochastic, KL, scaled_KL, top_one_KL, scaled_top_one_KL = compute_individual_fairness_metrics(X_train, X_train, proj_compl, num_items_per_query, l_pred, sess, position_bias, p, num_monte_carlo_samples, tf_scores, tf_sample_ranking, False, all_dict.copy())
+            else:
+                l2_score_distance, kts, scaled_kts, reg_kts, scaled_reg_kts, displacement_train_stochastic, heatmap_train_stochastic, KL, scaled_KL, top_one_KL, scaled_top_one_KL = compute_individual_fairness_metrics(X_train, CF_X_train, proj_compl, num_items_per_query, l_pred, sess, position_bias, p, num_monte_carlo_samples, tf_scores, tf_sample_ranking, False, all_dict.copy(), get_closest = False)
+
             print('\nFinal train DCG', np.mean(dcg_train.eval(feed_dict=all_dict)), fair_reg)
             print('\nFinal train NDCG (stochastic)', np.mean(ndcg_train.eval(feed_dict=all_dict)), fair_reg)
             train_stochastic_metrics.append(np.mean(ndcg_train.eval(feed_dict=all_dict)))
@@ -886,18 +1065,57 @@ def train_fair_nn(X_train, relevance_train, group_membership_train, num_items_pe
             train_stochastic_metrics.append(np.mean(group_exposure_train_stochastic_all.eval(feed_dict=all_dict)))
             _indv_exposure = compute_individual_exposure(position_bias, ranking_list, relevance_train)
             print('\nFinal train individual exposure (stochastic)', _indv_exposure, fair_reg)
+            train_stochastic_metrics.append(_indv_exposure)
+            print('\nFinal train l2_score_distance', l2_score_distance, fair_reg)
+            train_stochastic_metrics.append(l2_score_distance)
+            print('\nFinal train weighted KT (stochastic)', kts, fair_reg)
+            train_stochastic_metrics.append(kts)
+            print('\nFinal train scaled weighted KT (stochastic)', scaled_kts, fair_reg)
+            train_stochastic_metrics.append(scaled_kts)
+            print('\nFinal train weighted reg KT (stochastic)', reg_kts, fair_reg)
+            train_stochastic_metrics.append(reg_kts)
+            print('\nFinal train scaled weighted reg KT (stochastic)', scaled_reg_kts, fair_reg)
+            train_stochastic_metrics.append(scaled_reg_kts)
+            print('\nFinal train displacement_vec KT (stochastic)', displacement_train_stochastic, fair_reg)
+            train_stochastic_metrics.append(KL)
+            print('\nTrain KL with MC', KL)
+            ranking_list = get_rankings_list(tf_sample_ranking, num_monte_carlo_samples, tf_scores, num_items_per_query, l_pred, all_dict, sess, deterministic = True)
+            print('\nTrain scaled KL', scaled_KL)
+            train_stochastic_metrics.append(scaled_KL)
+            print('\nTrain top one KL', top_one_KL)
+            train_stochastic_metrics.append(top_one_KL)
+            print('\nTrain scaled top one KL', scaled_top_one_KL)
+            train_stochastic_metrics.append(scaled_top_one_KL)
             X_utility, relevance_utility, membership_utility = prepare_data_for_utility_objective(X_train, relevance_train, ranking_list, group_membership_train)
             all_dict[tf_X_utility] = X_utility
             all_dict[tf_relevances] = relevance_utility
             all_dict[tf_group_membership] = membership_utility
 
             ndcg_train, dcg_train, _, group_exposure_train_deterministic, _ = get_utility_objective(tf_group_membership, num_items_per_query, int(X_train.shape[0]/num_items_per_query), baseline_ndcg, 1, get_tf_ones_mean_matrix(1, int(X_train.shape[0] / num_items_per_query)), l_pred_utility, tf_lower_ones_matrix, tf_position_bias, tf.reshape(tf_relevances, shape=(int(1*X_train.shape[0]/num_items_per_query), num_items_per_query)))
+            if CF_X_train is None:
+                l2_score_distance, kts, scaled_kts, reg_kts, scaled_reg_kts, displacement_train_deterministic, heatmap_train_deterministic, _, _, _, _ = compute_individual_fairness_metrics(X_train, X_train, proj_compl, num_items_per_query, l_pred, sess, position_bias, p, 1, tf_scores, tf_sample_ranking, True, all_dict.copy())
+            else:
+                l2_score_distance, kts, scaled_kts, reg_kts, scaled_reg_kts, displacement_train_deterministic, heatmap_train_deterministic, _, _, _, _ = compute_individual_fairness_metrics(X_train, CF_X_train, proj_compl, num_items_per_query, l_pred, sess, position_bias, p, 1, tf_scores, tf_sample_ranking, True, all_dict.copy(), get_closest = False)
+
             print('\nFinal train NDCG (deterministic)', np.mean(ndcg_train.eval(feed_dict=all_dict)), fair_reg)
             train_deterministic_metrics.append(np.mean(ndcg_train.eval(feed_dict=all_dict)))
             print('\nFinal train group exposure (deterministic)', np.mean(group_exposure_train_deterministic.eval(feed_dict=all_dict)), fair_reg)
             train_deterministic_metrics.append(np.mean(group_exposure_train_deterministic.eval(feed_dict=all_dict)))
             _indiv_exposure = compute_individual_exposure(position_bias, ranking_list, relevance_train)
             print('\nFinal train individual exposure (deterministic)', _indiv_exposure, fair_reg)
+            train_deterministic_metrics.append(_indiv_exposure)
+            print('\nFinal train l2_score_distance', l2_score_distance, fair_reg)
+            train_deterministic_metrics.append(l2_score_distance)
+            print('\nFinal train weighted KT (deterministic)', kts, fair_reg)
+            train_deterministic_metrics.append(kts)
+            print('\nFinal train scaled weighted KT (derministic)', scaled_kts, fair_reg)
+            train_deterministic_metrics.append(scaled_kts)
+            print('\nFinal train weighted reg KT (deterministic)', reg_kts, fair_reg)
+            train_deterministic_metrics.append(reg_kts)
+            print('\nFinal train scaled weighted reg KT (deterministic)', scaled_reg_kts, fair_reg)
+            train_deterministic_metrics.append(scaled_reg_kts)
+            print('\nFinal train displacement_vec KT (deterministic)', displacement_train_deterministic, fair_reg)
+            train_deterministic_metrics.append(KL)
             if simul:
                 if load:
                     xx = np.load('data/xx.npy')
@@ -931,7 +1149,12 @@ def train_fair_nn(X_train, relevance_train, group_membership_train, num_items_pe
             print('\nFinal test NDCG (stochastic)', test_NDCG, fair_reg)
 
             if CF_X_test is None:
-                
+                l2_score_distance, kts, scaled_kts, reg_kts, scaled_reg_kts, displacement_test_stochastic, heatmap_test_stochastic, KL, scaled_KL, top_one_KL, scaled_top_one_KL = compute_individual_fairness_metrics(X_test, np.concatenate((X_train, X_test)), proj_compl, num_items_per_query, l_pred, sess, position_bias, p, num_monte_carlo_samples, tf_scores, tf_sample_ranking, False, all_dict.copy())
+            else:
+                l2_score_distance, kts, scaled_kts, reg_kts, scaled_reg_kts, displacement_test_stochastic, heatmap_test_stochastic, KL, scaled_KL, top_one_KL, scaled_top_one_KL = compute_individual_fairness_metrics(X_test, np.concatenate((X_train, X_test)), proj_compl, num_items_per_query, l_pred, sess, position_bias, p, num_monte_carlo_samples, tf_scores, tf_sample_ranking, False, all_dict.copy())
+
+                _l2_score_distance, _kts, _scaled_kts, _reg_kts, _scaled_reg_kts, _displacement_test_stochastic, _heatmap_test_stochastic, _KL, _scaled_KL, _top_one_KL, _scaled_top_one_KL = compute_individual_fairness_metrics(X_test, CF_X_test, proj_compl, num_items_per_query, l_pred, sess, position_bias, p, num_monte_carlo_samples, tf_scores, tf_sample_ranking, False, all_dict.copy(), get_closest= False)
+
             print('PREFIX', tf_prefix)
             print('\nFinal test DCG', np.mean(dcg_test.eval(feed_dict=all_dict)), fair_reg)
             test_NDCG = np.mean(ndcg_test.eval(feed_dict=all_dict))
@@ -942,8 +1165,29 @@ def train_fair_nn(X_train, relevance_train, group_membership_train, num_items_pe
             _indiv_exposure = compute_individual_exposure(position_bias, ranking_list, relevance_test)
             print('\nFinal test individual exposure (stochastic)', _indiv_exposure, fair_reg)
             test_stochastic_metrics.append(_indiv_exposure)
-            
+            print('\nFinal test l2_score_distance', l2_score_distance, fair_reg)
+            test_stochastic_metrics.append(l2_score_distance)
+            print('\nFinal test weighted KT (stochastic)', kts, fair_reg)
+            test_stochastic_metrics.append(kts)
+            print('\nFinal test scaled weighted KT (stochastic)', scaled_kts, fair_reg)
+            test_stochastic_metrics.append(scaled_kts)
+            print('\nFinal test reg KT (stochastic)', reg_kts, fair_reg)
+            test_stochastic_metrics.append(reg_kts)
+            print('\nFinal test scaled reg KT (stochastic)', scaled_reg_kts, fair_reg)
+            test_stochastic_metrics.append(scaled_reg_kts)
+            print('\nFinal test displacement_vec KT (stochastic)', displacement_test_stochastic, fair_reg)
+            print('\nTest KL with MC', KL)
+            test_stochastic_metrics.append(KL)
+            print('\nTest scaled KL', scaled_KL)
+            test_stochastic_metrics.append(scaled_KL)
+            print('\nTest top one KL', top_one_KL)
+            test_stochastic_metrics.append(top_one_KL)
+            print('\nTest scaled top one KL', scaled_top_one_KL)
+            test_stochastic_metrics.append(scaled_top_one_KL)
+
             if CF_X_test is not None:
+                test_stochastic_metrics.extend([_l2_score_distance, _kts, _scaled_kts, _reg_kts, _scaled_reg_kts, np.copy(_displacement_test_stochastic), np.copy(_heatmap_test_stochastic), _KL, _scaled_KL, _top_one_KL, _scaled_top_one_KL])
+
             ranking_list = get_rankings_list(tf_sample_ranking, num_monte_carlo_samples, tf_scores, num_items_per_query, l_pred, all_dict, sess, deterministic = True)
             ndcg_test, dcg_test, _, group_exposure_test_deterministic, results = get_utility_objective(tf_group_membership, num_items_per_query, int(X_test.shape[0] / num_items_per_query), baseline_ndcg, 1, get_tf_ones_mean_matrix(1, int(X_test.shape[0] / num_items_per_query)), l_pred_utility, tf_lower_ones_matrix, tf_position_bias, tf.reshape(tf_relevances, shape=(int(1*X_test.shape[0]/num_items_per_query), num_items_per_query)))
 
@@ -954,7 +1198,15 @@ def train_fair_nn(X_train, relevance_train, group_membership_train, num_items_pe
             all_dict[tf_group_membership] = membership_utility
             tic = time.perf_counter()
             if CF_X_test is None:
-            
+                l2_score_distance, kts, scaled_kts, reg_kts, scaled_reg_kts, displacement_test_deterministic, heatmap_test_deterministic, _, _, _, _ = compute_individual_fairness_metrics(X_test, np.concatenate((X_train, X_test)), proj_compl, num_items_per_query, l_pred, sess, position_bias, p, 1, tf_scores, tf_sample_ranking, True, all_dict.copy())
+            else:
+                l2_score_distance, kts, scaled_kts, reg_kts, scaled_reg_kts, displacement_test_deterministic, heatmap_test_deterministic, _, _, _, _ = compute_individual_fairness_metrics(X_test, np.concatenate((X_train, X_test)), proj_compl, num_items_per_query, l_pred, sess, position_bias, p, 1, tf_scores, tf_sample_ranking, True, all_dict.copy())
+
+                _l2_score_distance, _kts, _scaled_kts, _reg_kts, _scaled_reg_kts, _displacement_test_deterministic, _heatmap_test_deterministic, _, _, _, _ = compute_individual_fairness_metrics(X_test, CF_X_test, proj_compl, num_items_per_query, l_pred, sess, position_bias, p, 1, tf_scores, tf_sample_ranking, True, all_dict.copy(), get_closest = False)
+
+            #l2_score_distance, kts, scaled_kts, reg_kts, scaled_reg_kts, displacement_test_deterministic, heatmap_test_deterministic, _ = compute_individual_fairness_metrics(X_test, X_test, proj_compl, num_items_per_query, l_pred, sess, position_bias, p, 1, tf_scores, tf_sample_ranking, True, all_dict.copy())
+
+            print('PREFIX', tf_prefix)
             print('\nFinal test NDCG (deterministic)', np.mean(ndcg_test.eval(feed_dict=all_dict)), fair_reg)
             test_deterministic_metrics.append(np.mean(ndcg_test.eval(feed_dict=all_dict)))
             print('\nFinal group_exposure_test_deterministic (deterministic)', np.mean(group_exposure_test_deterministic.eval(feed_dict=all_dict)), fair_reg)
@@ -962,7 +1214,44 @@ def train_fair_nn(X_train, relevance_train, group_membership_train, num_items_pe
             _indv_exposure = compute_individual_exposure(position_bias, ranking_list, relevance_test)
             print('\nFinal test individual exposure (deterministic)', _indv_exposure, fair_reg)
             test_deterministic_metrics.append(_indv_exposure)
-            
+            print('\nFinal test l2_score_distance', l2_score_distance, fair_reg)
+            if CF_X_test is not None:
+                print('\nFinal test l2_score_distance (manual CFs)', _l2_score_distance, fair_reg)
+            test_deterministic_metrics.append(l2_score_distance)
+            print('\nFinal test weighted KT (deterministic)', kts, fair_reg)
+            if CF_X_test is not None:
+                print('\nFinal test weighted KT (deterministic) (manual CFs)', _kts, fair_reg)
+            test_deterministic_metrics.append(kts)
+            print('\nFinal test scaled KT (deterministic)', scaled_kts, fair_reg)
+            if CF_X_test is not None:
+                print('\nFinal test scaled KT (deterministic) (manual CFs)', _scaled_kts, fair_reg)
+            test_deterministic_metrics.append(scaled_kts)
+            print('\nFinal test reg KT (deterministic)', reg_kts, fair_reg)
+            if CF_X_test is not None:
+                print('\nFinal test reg KT (deterministic) (manual CFs)', _reg_kts, fair_reg)
+            test_deterministic_metrics.append(reg_kts)
+            print('\nFinal test scaled reg KT (deterministic)', scaled_reg_kts, fair_reg)
+            if CF_X_test is not None:
+                print('\nFinal test scaled reg KT (deterministic) (manual CFs)', _scaled_reg_kts, fair_reg)
+            test_deterministic_metrics.append(scaled_reg_kts)
+            print('\nFinal test displacement_vec KT (deterministic)', displacement_test_deterministic, fair_reg)
+            if CF_X_test is not None:
+                print('\nFinal test displacement_vec KT (deterministic) (manual CFs)', _displacement_test_deterministic, fair_reg)
+
+
+            test_deterministic_metrics.append(KL)
+            test_deterministic_metrics.append(0)
+            test_deterministic_metrics.append(0)
+            test_deterministic_metrics.append(0)
+            test_deterministic_metrics.append(0)
+
+            if CF_X_test is not None:
+                test_deterministic_metrics.append([_l2_score_distance, _kts, _scaled_kts, _reg_kts, _scaled_reg_kts, np.copy(_displacement_test_deterministic), np.copy(_heatmap_test_deterministic)])
+        else:
+            test_logits = None
+        if epsilon is not None:
+            print('Final lambda %f' % lamb)
+
         weights = [x.eval() for x in variables.values()]
 
         try:
